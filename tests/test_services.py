@@ -3,7 +3,9 @@
 import asyncio
 import json
 import time
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from homeassistant.config_entries import ConfigEntryState
@@ -17,6 +19,7 @@ from pytest_homeassistant_custom_component.common import (
 )
 
 import custom_components.lockly.manager as lockly_manager
+from custom_components.lockly import _handle_state_payload
 from custom_components.lockly.const import (
     CONF_ENDPOINT,
     CONF_FIRST_SLOT,
@@ -571,6 +574,185 @@ async def test_handle_mqtt_state_confirms_pending(
         "status": "enabled",
     }
     assert slot.busy is False
+
+
+@pytest.mark.enable_socket
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_pin_success_timestamp_completes_published_request(
+    hass: HomeAssistant, enable_custom_integrations: Any, *, enabled: bool
+) -> None:
+    """Z2M save/clear success completes only the corresponding lock request."""
+    entry = await _setup_entry(hass, enable_custom_integrations, skip_timeout=False)
+    mqtt_calls = async_mock_service(hass, "mqtt", "publish")
+    manager = hass.data[DOMAIN][entry.entry_id].manager
+    await manager.add_slot()
+    await manager.update_slot(1, name="Guest", pin="1234", enabled=enabled)
+    await _apply_to_two_locks(hass, entry)
+    key = "last_successful_pincode_save" if enabled else "last_successful_pincode_clear"
+    timestamp = int(time.time() * 1000)
+    action = manager._pending_actions[(1, "Garden Upper Lock")]  # noqa: SLF001
+    timer = action["handle"]
+
+    # State payloads can include an unrelated action alongside the timestamp.
+    await _handle_state_payload(
+        manager,
+        SimpleNamespace(
+            topic="zigbee2mqtt/Garden Upper Lock",
+            payload=json.dumps({key: timestamp, "action": "lock"}),
+        ),
+    )
+    slot = manager.coordinator.data[1]
+    assert timer.cancelled()
+    assert slot.busy is True
+    assert slot.status == "updating"
+    assert slot.last_response == {
+        "lock": "Garden Upper Lock",
+        "action": "pin_code_added" if enabled else "pin_code_deleted",
+        "status": "enabled" if enabled else "available",
+    }
+
+    await manager.handle_mqtt_state("Garden Lower Lock", {key: timestamp})
+    await hass.async_block_till_done()
+    assert slot.busy is False
+    assert slot.status == ""
+    await manager._handle_action_timeout(1, "Garden Upper Lock")  # noqa: SLF001
+    assert len(mqtt_calls) == 2
+
+
+@pytest.mark.enable_socket
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"last_successful_pincode_save": 1},
+        {"last_successful_pincode_save": "now"},
+        {"last_successful_pincode_save": None},
+        {"last_successful_pincode_save": True},
+        {"last_successful_pincode_save": float("inf")},
+        {"last_successful_pincode_save": float("nan")},
+        {"last_successful_pincode_clear": "fresh"},
+        {"status": 0},
+    ],
+)
+async def test_pin_success_ignores_unmatched_state(
+    hass: HomeAssistant, enable_custom_integrations: Any, payload: dict
+) -> None:
+    """Old, malformed, and wrong-operation acknowledgments cannot finish a save."""
+    entry = await _setup_entry(hass, enable_custom_integrations, skip_timeout=False)
+    mqtt_calls = async_mock_service(hass, "mqtt", "publish")
+    manager = hass.data[DOMAIN][entry.entry_id].manager
+    await manager.add_slot()
+    await manager.update_slot(1, name="Guest", pin="1234", enabled=True)
+    await manager.apply_slot(
+        1,
+        lockly_manager.ApplySlotOptions(
+            lock_entities=["lock.garden_upper_lock"], wait_for_completion=False
+        ),
+    )
+    await _wait_for_mqtt_calls(mqtt_calls, 1)
+    if payload.get("last_successful_pincode_clear") == "fresh":
+        payload = {"last_successful_pincode_clear": int(time.time() * 1000)}
+    await manager.handle_mqtt_state("Garden Upper Lock", payload)
+    assert manager.coordinator.data[1].busy is True
+    assert manager.coordinator.data[1].last_response is None
+    await manager.handle_mqtt_action(
+        "Garden Upper Lock", "pin_code_added", action_user=1
+    )
+    await hass.async_block_till_done()
+
+
+@pytest.mark.enable_socket
+async def test_pin_success_cached_timestamp_does_not_complete_next_slot(
+    hass: HomeAssistant, enable_custom_integrations: Any
+) -> None:
+    """A cached success cannot acknowledge another slot, even in the same ms."""
+    entry = await _setup_entry(hass, enable_custom_integrations, skip_timeout=False)
+    mqtt_calls = async_mock_service(hass, "mqtt", "publish")
+    manager = hass.data[DOMAIN][entry.entry_id].manager
+    for slot_id in (1, 2):
+        await manager.add_slot()
+        await manager.update_slot(slot_id, pin="1234", enabled=True)
+        await manager.apply_slot(
+            slot_id,
+            lockly_manager.ApplySlotOptions(
+                lock_entities=["lock.garden_upper_lock"], wait_for_completion=False
+            ),
+        )
+    await _wait_for_mqtt_calls(mqtt_calls, 1)
+    timestamp = int(time.time() * 1000)
+    payload = {"last_successful_pincode_save": timestamp}
+    await manager.handle_mqtt_state("Garden Upper Lock", payload)
+    await _wait_for_mqtt_calls(mqtt_calls, 2)
+    await manager.handle_mqtt_state("Garden Upper Lock", payload)
+    assert manager.coordinator.data[1].busy is False
+    assert manager.coordinator.data[2].busy is True
+    await manager.handle_mqtt_state(
+        "Garden Upper Lock",
+        {"last_successful_pincode_save": int(time.time() * 1000) + 1},
+    )
+    assert manager.coordinator.data[2].busy is False
+
+
+@pytest.mark.enable_socket
+async def test_pin_success_does_not_complete_unpublished_request(
+    hass: HomeAssistant, enable_custom_integrations: Any, monkeypatch: Any
+) -> None:
+    """A success received before publish cannot acknowledge a queued request."""
+    entry = await _setup_entry(hass, enable_custom_integrations, skip_timeout=False)
+    manager = hass.data[DOMAIN][entry.entry_id].manager
+    monkeypatch.setattr(manager, "_enqueue_publish", AsyncMock())
+    await manager.add_slot()
+    await manager.update_slot(1, pin="1234", enabled=True)
+    await manager.apply_slot(
+        1,
+        lockly_manager.ApplySlotOptions(
+            lock_entities=["lock.garden_upper_lock"], wait_for_completion=False
+        ),
+    )
+    await hass.async_block_till_done()
+    timestamp = int(time.time() * 1000)
+    await manager.handle_mqtt_state(
+        "Garden Upper Lock", {"last_successful_pincode_save": timestamp}
+    )
+    assert manager.coordinator.data[1].busy is True
+
+    manager._start_action_timer(1, "Garden Upper Lock")  # noqa: SLF001
+    # The timestamp observed before publish is still ineligible after publish.
+    await manager.handle_mqtt_state(
+        "Garden Upper Lock", {"last_successful_pincode_save": timestamp}
+    )
+    assert manager.coordinator.data[1].busy is True
+    await manager.handle_mqtt_state(
+        "Garden Upper Lock",
+        {"last_successful_pincode_save": int(time.time() * 1000) + 1},
+    )
+    assert manager.coordinator.data[1].busy is False
+    await hass.async_block_till_done()
+
+
+@pytest.mark.enable_socket
+async def test_pin_changed_action_completes_request(
+    hass: HomeAssistant, enable_custom_integrations: Any
+) -> None:
+    """An existing PIN update may emit pin_code_changed rather than added."""
+    entry = await _setup_entry(hass, enable_custom_integrations, skip_timeout=False)
+    mqtt_calls = async_mock_service(hass, "mqtt", "publish")
+    manager = hass.data[DOMAIN][entry.entry_id].manager
+    await manager.add_slot()
+    await manager.update_slot(1, pin="1234", enabled=True)
+    await manager.apply_slot(
+        1,
+        lockly_manager.ApplySlotOptions(
+            lock_entities=["lock.garden_upper_lock"], wait_for_completion=False
+        ),
+    )
+    await _wait_for_mqtt_calls(mqtt_calls, 1)
+    await manager.handle_mqtt_action(
+        "Garden Upper Lock", "pin_code_changed", action_user=1
+    )
+    slot = manager.coordinator.data[1]
+    assert slot.busy is False
+    assert slot.last_response["status"] == "enabled"
+    await hass.async_block_till_done()
 
 
 @pytest.mark.enable_socket

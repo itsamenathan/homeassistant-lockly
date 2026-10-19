@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import time
 from collections.abc import Callable, Coroutine, Iterable
@@ -109,6 +110,7 @@ class LocklyManager:
         self._pending_lock_names: dict[int, list[str]] = {}
         self._slot_outcomes: dict[int, dict[str, str]] = {}
         self._pending_actions: dict[tuple[int, str], dict[str, object]] = {}
+        self._pin_success_timestamps: dict[tuple[str, str], int | float] = {}
         self._lock_queues: dict[str, asyncio.Queue[tuple[int, dict]]] = {}
         self._lock_workers: dict[str, asyncio.Task] = {}
         self._slot_publish_started: set[int] = set()
@@ -766,6 +768,9 @@ class LocklyManager:
         action = self._pending_actions.get((slot_id, lock_name))
         if not action or action.get("handle"):
             return
+        # Z2M's Date.now() acknowledgments have millisecond precision. Keep the
+        # first publish time across retries so a delayed success still counts.
+        action.setdefault("started_at", int(time.time() * 1000))
         action["handle"] = self._hass.loop.call_later(
             DEFAULT_ACTION_TIMEOUT,
             lambda: self._hass.async_create_task(
@@ -969,6 +974,8 @@ class LocklyManager:
         if fire_lock_event:
             self._fire_lock_event(lock_name, action, action_user, action_source_name)
 
+        if action not in ("pin_code_added", "pin_code_changed", "pin_code_deleted"):
+            return
         slot_id = self._dequeue_pending_slot(
             lock_name, action, slot_id=action_user, source="action"
         )
@@ -978,7 +985,9 @@ class LocklyManager:
 
     async def handle_mqtt_state(self, lock_name: str, payload: dict) -> None:
         """Handle MQTT state updates to confirm pending actions."""
-        match = self._match_pending_state(lock_name, payload)
+        match = self._match_pin_success(lock_name, payload)
+        if match is None:
+            match = self._match_pending_state(lock_name, payload)
         if match is None:
             return
         slot_id, action_name, status = match
@@ -994,6 +1003,48 @@ class LocklyManager:
         if slot_id is None:
             return
         await self._complete_action(lock_name, slot_id, action_name)
+
+    def _match_pin_success(
+        self, lock_name: str, payload: dict
+    ) -> tuple[int, str, str] | None:
+        """Match fresh Z2M PIN save/clear timestamps to a published request.
+
+        These acknowledgments have no user ID. Slot jobs are serialized, so
+        only one published request for this lock can be eligible. Z2M also
+        includes cached timestamps in later state messages; never reuse one.
+        """
+        fresh: dict[str, int | float] = {}
+        for key in ("last_successful_pincode_save", "last_successful_pincode_clear"):
+            timestamp = payload.get(key)
+            if type(timestamp) not in (int, float) or not math.isfinite(timestamp):
+                continue
+            previous = self._pin_success_timestamps.get((lock_name, key), 0)
+            if timestamp > previous:
+                self._pin_success_timestamps[(lock_name, key)] = timestamp
+                fresh[key] = timestamp
+        candidates = [
+            (slot_id, action)
+            for (slot_id, name), action in self._pending_actions.items()
+            if name == lock_name and action.get("handle") is not None
+        ]
+        if len(candidates) != 1:
+            return None
+        slot_id, action = candidates[0]
+        enabled = action["payload"]["pin_code"]["user_enabled"]
+        key = (
+            "last_successful_pincode_save"
+            if enabled
+            else "last_successful_pincode_clear"
+        )
+        timestamp = fresh.get(key)
+        started_at = action.get("started_at")
+        if timestamp is None or started_at is None or timestamp < started_at:
+            return None
+        return (
+            slot_id,
+            "pin_code_added" if enabled else "pin_code_deleted",
+            "enabled" if enabled else "available",
+        )
 
     def _match_pending_state(
         self, lock_name: str, payload: dict
@@ -1036,7 +1087,7 @@ class LocklyManager:
             pending_locks.discard(lock_name)
         if action == "pin_code_deleted":
             status = "available"
-        elif action == "pin_code_added":
+        elif action in ("pin_code_added", "pin_code_changed"):
             status = "enabled"
         else:
             status = "unknown"

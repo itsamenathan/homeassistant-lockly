@@ -540,7 +540,7 @@ async def _handle_state_payload(
         action_source_name = payload.get("action_source_name")
         if not isinstance(action_source_name, str):
             action_source_name = None
-        if action in ("pin_code_added", "pin_code_deleted"):
+        if action in ("pin_code_added", "pin_code_changed", "pin_code_deleted"):
             action_source_name = None
         LOGGER.debug("MQTT %s action: %s", topic, action)
         await manager.handle_mqtt_action(
@@ -550,7 +550,6 @@ async def _handle_state_payload(
             action_source_name=action_source_name,
             fire_lock_event=True,
         )
-        return
     await manager.handle_mqtt_state(lock_name, payload)
 
 
