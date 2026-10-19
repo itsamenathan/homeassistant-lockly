@@ -178,6 +178,12 @@ Requires Home Assistant 2026.4.0 or newer.
 
 ## Configuration
 
+For Yale Assure lock 2 `YRD430-BLE` locks on Zigbee2MQTT 2.14.2 that remain
+`Updating` after a successful PIN write, see the
+[Zigbee2MQTT companion converter](zigbee2mqtt/README.md). That version's Yale
+definition omits the PIN write response converter; HACS does not install this
+companion automatically.
+
 1. Go to Settings > Devices & Services and add the Lockly integration.
 2. Set the first and last slot, MQTT base topic, and update endpoint.
 

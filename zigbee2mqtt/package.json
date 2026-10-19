@@ -1,0 +1,12 @@
+{
+  "name": "lockly-yale-pin-response-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test-yale-yrd430-pin-response.mjs"
+  },
+  "devDependencies": {
+    "zigbee-herdsman": "10.10.0",
+    "zigbee-herdsman-converters": "26.115.1"
+  }
+}

@@ -12,6 +12,7 @@ __pycache__
 coverage.xml
 .ruff_cache
 .claude/
+zigbee2mqtt/node_modules/
 
 
 # Home Assistant configuration
