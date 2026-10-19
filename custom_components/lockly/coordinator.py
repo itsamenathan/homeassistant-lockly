@@ -63,12 +63,22 @@ class LocklySlotCoordinator(DataUpdateCoordinator[dict[int, LocklySlot]]):
         """Load slot state from storage."""
         stored = await self._store.async_load() or []
         self.data = {}
+        recovered = False
         for item in stored:
             if "slot" not in item:
                 continue
             slot_id = int(item["slot"])
             slot = LocklySlot(**{**item, "slot": slot_id})
+            if slot.busy or slot.status in ("queued", "updating"):
+                # Jobs and response timers are not restored after a restart.
+                # Keep the result unknown/retryable, without resending a PIN
+                # or overwriting the last response from the lock.
+                slot.busy = False
+                slot.status = "timeout"
+                recovered = True
             self.data[slot_id] = slot
+        if recovered:
+            await self.async_save()
         self.async_set_updated_data(self.data)
 
     async def async_save(self) -> None:

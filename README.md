@@ -259,6 +259,12 @@ in-card "All vs Enabled only" filter is remembered per browser across reloads.
 - Slots are stored in Home Assistant and applied to one or more locks as needed.
 - The card shows live state (queued, updating, timeout) and gives you a clear, consistent edit flow.
 
+If Home Assistant restarts or Lockly reloads during an update, the pending job
+cannot resume. On startup, Lockly clears its saved busy state and marks the slot
+`timeout` so it can be edited or retried. The previous response and timestamp
+are preserved. This does not determine whether the PIN reached the lock, and
+startup recovery sends no commands to the lock.
+
 ### Resource registration
 
 - Storage mode (default): the integration registers the card automatically.
